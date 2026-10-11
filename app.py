@@ -345,27 +345,46 @@ Return JSON only when JSON is requested.
 """
 
 
-def create_ai_client():
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+def _get_setting(name, default=""):
+    """Read a setting from environment variables, then Streamlit Secrets."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
 
-    base_url = os.getenv(
+    try:
+        value = str(st.secrets.get(name, "")).strip()
+    except Exception:
+        # Streamlit Secrets may not be configured during local development.
+        value = ""
+
+    return value or default
+
+
+def create_ai_client():
+    api_key = _get_setting("OPENAI_API_KEY")
+    base_url = _get_setting(
         "OPENAI_BASE_URL",
         "https://bedrock-mantle.eu-north-1.api.aws/v1",
-    ).strip()
-
-    model_id = os.getenv(
+    )
+    model_id = _get_setting(
         "BEDROCK_MODEL_ID",
         "openai.gpt-oss-120b",
-    ).strip()
+    )
 
     if not api_key:
         raise ValueError(
-            "OPENAI_API_KEY is missing. Check your .env file."
+            "OPENAI_API_KEY is missing. Configure it in your .env file "
+            "or Streamlit Cloud Secrets."
+        )
+
+    if not base_url:
+        raise ValueError(
+            "OPENAI_BASE_URL is missing from your configuration."
         )
 
     if not model_id:
         raise ValueError(
-            "BEDROCK_MODEL_ID is missing from your .env file."
+            "BEDROCK_MODEL_ID is missing from your configuration."
         )
 
     client = OpenAI(
@@ -410,27 +429,37 @@ def ask_tutor(
 # QUIZ VALIDATION AND DUPLICATE DETECTION
 # ============================================================
 
+
 def parse_json_response(text):
-    """Parse JSON, including a response accidentally wrapped in fences."""
+    """Parse JSON, including a response wrapped in Markdown fences."""
+    if not isinstance(text, str):
+        raise ValueError("The AI response must be text.")
+
     cleaned = text.strip()
 
+    # Remove opening and closing Markdown code fences.
     cleaned = re.sub(
         r"^```(?:json)?\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
-
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
 
     try:
         return json.loads(cleaned)
+
     except json.JSONDecodeError:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
 
         if start >= 0 and end > start:
-            return json.loads(cleaned[start:end + 1])
+            try:
+                return json.loads(cleaned[start:end + 1])
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "The AI returned malformed JSON. Please try again."
+                ) from error
 
         raise ValueError(
             "The AI did not return valid quiz JSON. Please try again."
@@ -447,6 +476,7 @@ def normalize_question(text):
 
 
 def is_duplicate_question(question, existing_questions):
+    """Detect exact and near-duplicate questions."""
     normalized = normalize_question(question)
 
     if not normalized:
@@ -458,7 +488,6 @@ def is_duplicate_question(question, existing_questions):
         if normalized == old_normalized:
             return True
 
-        # Fuzzy matching for questions with similar wording.
         if min(len(normalized), len(old_normalized)) >= 30:
             similarity = SequenceMatcher(
                 None,
@@ -494,15 +523,27 @@ def validate_question(question, number):
             + ", ".join(sorted(missing))
         )
 
-    stem = str(question["question"]).strip()
-    explanation = str(question["explanation"]).strip()
+    # Validate field types before processing them.
+    if not isinstance(question["question"], str):
+        raise ValueError(
+            f"Question {number} text must be a string."
+        )
+
+    if not isinstance(question["explanation"], str):
+        raise ValueError(
+            f"Question {number} explanation must be a string."
+        )
+
+    if not isinstance(question["options"], dict):
+        raise ValueError(
+            f"Question {number} options must be an object."
+        )
+
+    stem = question["question"].strip()
+    explanation = question["explanation"].strip()
     options = question["options"]
 
-    correct = str(
-        question["correct_answer"]
-    ).strip().upper()
-
-    if len(stem) < 8:
+    if not stem or len(stem) < 8:
         raise ValueError(
             f"Question {number} has insufficient question text."
         )
@@ -512,18 +553,23 @@ def validate_question(question, number):
             f"Question {number} has no explanation."
         )
 
-    if not isinstance(options, dict):
-        raise ValueError(
-            f"Question {number} options must be an object."
-        )
-
     if set(options.keys()) != {"A", "B", "C", "D"}:
         raise ValueError(
             f"Question {number} must contain options A, B, C, and D."
         )
 
+    # Require actual text values instead of silently converting
+    # nulls, lists, or other invalid values into strings.
+    if any(
+        not isinstance(options[letter], str)
+        for letter in "ABCD"
+    ):
+        raise ValueError(
+            f"Question {number} options must all be strings."
+        )
+
     options = {
-        letter: str(options[letter]).strip()
+        letter: options[letter].strip()
         for letter in "ABCD"
     }
 
@@ -542,18 +588,30 @@ def validate_question(question, number):
             f"Question {number} has duplicate answer options."
         )
 
+    correct = question["correct_answer"]
+
+    if not isinstance(correct, str):
+        raise ValueError(
+            f"Question {number} correct_answer must be a letter."
+        )
+
+    correct = correct.strip().upper()
+
     if correct not in {"A", "B", "C", "D"}:
         raise ValueError(
             f"Question {number} has an invalid correct answer."
         )
 
+    topic_tag = question.get("topic_tag", "General")
+
+    if not isinstance(topic_tag, str):
+        topic_tag = "General"
+
     question["question"] = stem
     question["options"] = options
     question["correct_answer"] = correct
     question["explanation"] = explanation
-    question["topic_tag"] = str(
-        question.get("topic_tag", "General")
-    ).strip() or "General"
+    question["topic_tag"] = topic_tag.strip() or "General"
 
     return question
 
@@ -569,7 +627,10 @@ def generate_quiz_batch(
     existing_topics,
     start_number,
 ):
-    """Generate and validate one batch; reject duplicates and retry."""
+    """Generate and validate a batch, retrying invalid responses."""
+
+    if not isinstance(count, int) or count < 1:
+        raise ValueError("Question count must be a positive integer.")
 
     accepted = []
     seen_questions = list(existing_questions)
@@ -597,7 +658,7 @@ Subject: {subject}
 Topic: {topic}
 Difficulty: {level}
 
-Return JSON only, using this structure:
+Return a valid JSON object only, using this structure:
 {{
   "questions": [
     {{
@@ -617,7 +678,9 @@ Return JSON only, using this structure:
 
 Rules:
 - Return exactly {needed} questions.
-- Each question must have four non-empty options: A, B, C, D.
+- Return JSON only, without Markdown fences or extra text.
+- Each question must have four non-empty string options: A, B, C, D.
+- All four options must be different.
 - Exactly one option must be correct.
 - correct_answer must be the correct option letter.
 - Explanation must support the selected correct answer.
@@ -640,32 +703,44 @@ Rules:
             temperature=0.2,
         )
 
-        data = parse_json_response(raw)
+        # Invalid JSON should use the next retry instead of
+        # immediately stopping the entire quiz generation.
+        try:
+            data = parse_json_response(raw)
+        except ValueError:
+            if attempt == 2:
+                raise RuntimeError(
+                    "The AI returned invalid quiz JSON after "
+                    "3 attempts. Please try again."
+                )
+            continue
 
         if not isinstance(data, dict):
-            raise ValueError(
-                "Quiz response must be a JSON object."
-            )
+            if attempt == 2:
+                raise RuntimeError(
+                    "The AI quiz response must be a JSON object."
+                )
+            continue
 
         items = data.get("questions")
 
         if not isinstance(items, list):
-            raise ValueError(
-                "Quiz JSON must contain a questions list."
-            )
+            if attempt == 2:
+                raise RuntimeError(
+                    "The AI quiz JSON must contain a questions list."
+                )
+            continue
 
         for item in items:
             if len(accepted) >= count:
                 break
 
-            # Skip malformed individual items and ask the model
-            # for replacements in a subsequent attempt.
             try:
                 candidate = validate_question(
                     item,
                     start_number + len(accepted),
                 )
-            except ValueError:
+            except (ValueError, TypeError, KeyError):
                 continue
 
             if is_duplicate_question(
@@ -893,6 +968,11 @@ Finish with "Your Next Move" and one manageable task.
                     "level": level,
                 }
 
+        except json.JSONDecodeError:
+            st.error(
+                "The AI returned invalid JSON. Please try again."
+            )
+
         except ValueError as error:
             st.error(str(error))
 
@@ -923,11 +1003,6 @@ Finish with "Your Next Move" and one manageable task.
         except RuntimeError as error:
             st.error("Quiz generation could not be completed.")
             st.caption(str(error))
-
-        except json.JSONDecodeError:
-            st.error(
-                "The AI returned invalid JSON. Please try again."
-            )
 
         except Exception as error:
             st.error("An unexpected error occurred.")
